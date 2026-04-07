@@ -19,6 +19,8 @@ DEFAULT_CONFIG_PATH = "services.json"
 DEFAULT_INTERVAL = 60
 DEFAULT_TIMEOUT = 10
 DEFAULT_RETRIES = 3
+DEFAULT_RETRY_DELAY = 2
+DEFAULT_RETRY_BACKOFF = "exponential"
 STATE_FILE = ".uptime_state.json"
 
 running = True
@@ -63,6 +65,9 @@ def load_config(config_path):
             "expected_status": svc.get("expected_status", 200),
             "method": svc.get("method", "GET"),
             "headers": svc.get("headers", {}),
+            "retries": svc.get("retries", None),
+            "retry_delay": svc.get("retry_delay", None),
+            "retry_backoff": svc.get("retry_backoff", None),
         })
 
     if not validated:
@@ -88,41 +93,99 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def probe_service(service, timeout):
+def calculate_retry_delay(attempt, base_delay, backoff_strategy):
+    """Calculate delay before the next retry attempt.
+
+    Args:
+        attempt: The current attempt number (1-based).
+        base_delay: Base delay in seconds.
+        backoff_strategy: 'constant', 'linear', or 'exponential'.
+
+    Returns:
+        Delay in seconds before the next retry.
+    """
+    if backoff_strategy == "constant":
+        return base_delay
+    elif backoff_strategy == "linear":
+        return base_delay * attempt
+    elif backoff_strategy == "exponential":
+        return base_delay * (2 ** (attempt - 1))
+    else:
+        return base_delay
+
+
+def probe_service(service, timeout, retries=None, retry_delay=None, retry_backoff=None):
+    """Probe a service with retry logic.
+
+    Args:
+        service: Service configuration dict.
+        timeout: Request timeout in seconds.
+        retries: Override for retry count (uses DEFAULT_RETRIES if None).
+        retry_delay: Override for base retry delay in seconds (uses DEFAULT_RETRY_DELAY if None).
+        retry_backoff: Override for backoff strategy (uses DEFAULT_RETRY_BACKOFF if None).
+
+    Returns:
+        Dict with probe result and retry metadata.
+    """
     url = service["url"]
     method = service["method"]
     headers = service.get("headers", {})
 
-    req = Request(url, method=method, headers=headers)
-    start = time.monotonic()
+    max_retries = retries if retries is not None else DEFAULT_RETRIES
+    base_delay = retry_delay if retry_delay is not None else DEFAULT_RETRY_DELAY
+    backoff = retry_backoff if retry_backoff is not None else DEFAULT_RETRY_BACKOFF
 
-    try:
-        resp = urlopen(req, timeout=timeout)
-        elapsed = time.monotonic() - start
-        status_code = resp.getcode()
-        body = resp.read()
-        return {
-            "success": True,
-            "status_code": status_code,
-            "response_time": round(elapsed, 3),
-            "response_size": len(body),
-        }
-    except HTTPError as e:
-        elapsed = time.monotonic() - start
-        return {
-            "success": False,
-            "status_code": e.code,
-            "response_time": round(elapsed, 3),
-            "error": str(e),
-        }
-    except (URLError, TimeoutError, OSError) as e:
-        elapsed = time.monotonic() - start
-        return {
-            "success": False,
-            "status_code": None,
-            "response_time": round(elapsed, 3),
-            "error": str(e),
-        }
+    attempts = []
+    last_result = None
+
+    for attempt in range(1, max_retries + 1):
+        req = Request(url, method=method, headers=headers)
+        start = time.monotonic()
+
+        try:
+            resp = urlopen(req, timeout=timeout)
+            elapsed = time.monotonic() - start
+            status_code = resp.getcode()
+            body = resp.read()
+            last_result = {
+                "success": True,
+                "status_code": status_code,
+                "response_time": round(elapsed, 3),
+                "response_size": len(body),
+                "attempt": attempt,
+            }
+            break
+        except HTTPError as e:
+            elapsed = time.monotonic() - start
+            last_result = {
+                "success": False,
+                "status_code": e.code,
+                "response_time": round(elapsed, 3),
+                "error": str(e),
+                "attempt": attempt,
+            }
+        except (URLError, TimeoutError, OSError) as e:
+            elapsed = time.monotonic() - start
+            last_result = {
+                "success": False,
+                "status_code": None,
+                "response_time": round(elapsed, 3),
+                "error": str(e),
+                "attempt": attempt,
+            }
+
+        attempts.append(last_result)
+
+        if attempt < max_retries:
+            delay = calculate_retry_delay(attempt, base_delay, backoff)
+            if not running:
+                break
+            time.sleep(delay)
+
+    last_result["total_attempts"] = max_retries
+    last_result["retry_count"] = len(attempts)
+
+    return last_result
 
 
 def send_email_alert(service_name, url, error, smtp_config):
@@ -144,7 +207,7 @@ def send_email_alert(service_name, url, error, smtp_config):
         if smtp_config.get("use_tls", True):
             server = smtplib.SMTP_SSL(smtp_config["host"], smtp_config.get("port", 465))
         else:
-            server = smtplib(smtp_config["host"], smtp_config.get("port", 587))
+            server = smtplib.SMTP(smtp_config["host"], smtp_config.get("port", 587))
             server.starttls()
 
         server.login(smtp_config["user"], smtp_config["password"])
@@ -186,25 +249,34 @@ def format_status(service, result, consecutive_fails):
     url = service["url"]
     expected = service["expected_status"]
 
+    retry_info = ""
+    if result.get("retry_count", 0) > 0:
+        retry_info = f" (after {result['retry_count']} retries)"
+
     if result["success"]:
         status_icon = "OK"
         detail = f"{result['status_code']} | {result['response_time']:.3f}s | {result['response_size']}B"
         if consecutive_fails > 0:
             detail += f" (recovered after {consecutive_fails} failures)"
+        if retry_info:
+            detail += retry_info
     else:
         status_icon = "DOWN"
         detail = f"expected {expected}, got {result['status_code']}" if result["status_code"] else result["error"]
+        if retry_info:
+            detail += retry_info
 
     timestamp = datetime.now().strftime("%H:%M:%S")
     return f"[{timestamp}] [{status_icon:>4}] {name:<20} {url:<50} {detail}"
 
 
-def run_probe_loop(services, interval, timeout, retries, alert_config, verbose):
+def run_probe_loop(services, interval, timeout, retries, alert_config, verbose, retry_delay, retry_backoff):
     state = load_state()
     consecutive_fails = {svc["name"]: state.get(svc["name"], {}).get("consecutive_fails", 0) for svc in services}
     alert_cooldown = {svc["name"]: state.get(svc["name"], {}).get("alert_cooldown_until", 0) for svc in services}
 
     print(f"[info] starting uptime probe – monitoring {len(services)} service(s) every {interval}s")
+    print(f"[info] retry config: {retries} max attempts, {retry_backoff} backoff, {retry_delay}s base delay")
     print(f"[info] press Ctrl+C to stop\n")
 
     while running:
@@ -213,13 +285,11 @@ def run_probe_loop(services, interval, timeout, retries, alert_config, verbose):
             url = service["url"]
             expected = service["expected_status"]
 
-            result = None
-            for attempt in range(1, retries + 1):
-                result = probe_service(service, timeout)
-                if result["success"] and result["status_code"] == expected:
-                    break
-                if attempt < retries:
-                    time.sleep(1)
+            svc_retries = service["retries"] if service["retries"] is not None else retries
+            svc_retry_delay = service["retry_delay"] if service["retry_delay"] is not None else retry_delay
+            svc_retry_backoff = service["retry_backoff"] if service["retry_backoff"] is not None else retry_backoff
+
+            result = probe_service(service, timeout, retries=svc_retries, retry_delay=svc_retry_delay, retry_backoff=svc_retry_backoff)
 
             is_healthy = result["success"] and result["status_code"] == expected
 
@@ -271,18 +341,17 @@ def run_probe_loop(services, interval, timeout, retries, alert_config, verbose):
     save_state(state)
 
 
-def run_single_check(services, timeout, retries):
-    print(f"[info] running single check against {len(services)} service(s)\n")
+def run_single_check(services, timeout, retries, retry_delay, retry_backoff):
+    print(f"[info] running single check against {len(services)} service(s)")
+    print(f"[info] retry config: {retries} max attempts, {retry_backoff} backoff, {retry_delay}s base delay\n")
 
     all_healthy = True
     for service in services:
-        result = None
-        for attempt in range(1, retries + 1):
-            result = probe_service(service, timeout)
-            if result["success"] and result["status_code"] == service["expected_status"]:
-                break
-            if attempt < retries:
-                time.sleep(1)
+        svc_retries = service["retries"] if service["retries"] is not None else retries
+        svc_retry_delay = service["retry_delay"] if service["retry_delay"] is not None else retry_delay
+        svc_retry_backoff = service["retry_backoff"] if service["retry_backoff"] is not None else retry_backoff
+
+        result = probe_service(service, timeout, retries=svc_retries, retry_delay=svc_retry_delay, retry_backoff=svc_retry_backoff)
 
         is_healthy = result["success"] and result["status_code"] == service["expected_status"]
         if not is_healthy:
@@ -307,6 +376,7 @@ examples:
   %(prog)s --config services.json --interval 30
   %(prog)s --check-once --config services.json
   %(prog)s --config services.json --alert-type webhook --webhook-url https://hooks.slack.com/...
+  %(prog)s --config services.json --retries 5 --retry-delay 3 --retry-backoff exponential
         """,
     )
 
@@ -314,6 +384,8 @@ examples:
     parser.add_argument("-i", "--interval", type=int, default=DEFAULT_INTERVAL, help=f"check interval in seconds (default: {DEFAULT_INTERVAL})")
     parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"request timeout in seconds (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("-r", "--retries", type=int, default=DEFAULT_RETRIES, help=f"retry count per check (default: {DEFAULT_RETRIES})")
+    parser.add_argument("--retry-delay", type=float, default=DEFAULT_RETRY_DELAY, help=f"base delay between retries in seconds (default: {DEFAULT_RETRY_DELAY})")
+    parser.add_argument("--retry-backoff", choices=["constant", "linear", "exponential"], default=DEFAULT_RETRY_BACKOFF, help=f"backoff strategy for retries (default: {DEFAULT_RETRY_BACKOFF})")
     parser.add_argument("--check-once", action="store_true", help="run a single check and exit")
     parser.add_argument("--verbose", action="store_true", help="show OK results in loop mode")
     parser.add_argument("--alert-type", choices=["log", "email", "webhook", "both"], default="log", help="alert method (default: log)")
@@ -354,9 +426,9 @@ examples:
         alert_config["webhook_url"] = args.webhook_url
 
     if args.check_once:
-        run_single_check(services, args.timeout, args.retries)
+        run_single_check(services, args.timeout, args.retries, args.retry_delay, args.retry_backoff)
     else:
-        run_probe_loop(services, args.interval, args.timeout, args.retries, alert_config, args.verbose)
+        run_probe_loop(services, args.interval, args.timeout, args.retries, alert_config, args.verbose, args.retry_delay, args.retry_backoff)
 
 
 if __name__ == "__main__":

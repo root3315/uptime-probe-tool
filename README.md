@@ -53,6 +53,47 @@ python main.py --config services.json --check-once
 
 Exits 0 if all healthy, 1 if anything is down. Handy for CI or cron.
 
+## Retry logic
+
+When a service fails to respond, the tool automatically retries before marking it as down. Three backoff strategies are available:
+
+| Strategy | Behavior |
+|---|---|
+| `constant` | Same delay between every retry |
+| `linear` | Delay increases linearly (delay × attempt number) |
+| `exponential` | Delay doubles each attempt (delay × 2^(attempt-1)) |
+
+```bash
+# 5 retries with exponential backoff starting at 3 seconds
+python main.py --config services.json --retries 5 --retry-delay 3 --retry-backoff exponential
+
+# 3 retries with a fixed 5-second delay
+python main.py --config services.json --retries 3 --retry-delay 5 --retry-backoff constant
+```
+
+You can also override retry settings per service in `services.json`:
+
+```json
+[
+  {
+    "name": "flaky-service",
+    "url": "https://flaky.example.com/health",
+    "retries": 5,
+    "retry_delay": 3,
+    "retry_backoff": "exponential"
+  },
+  {
+    "name": "stable-service",
+    "url": "https://stable.example.com/health",
+    "retries": 2,
+    "retry_delay": 1,
+    "retry_backoff": "constant"
+  }
+]
+```
+
+Per-service settings take precedence over the CLI flags.
+
 ## Alerts
 
 By default it just logs to stdout. You can set up email or webhook alerts.
@@ -96,6 +137,9 @@ Each service in the JSON array supports:
 | `expected_status` | no | 200 | What status code counts as healthy |
 | `method` | no | GET | HTTP method |
 | `headers` | no | {} | Extra headers (auth, custom user-agent, etc.) |
+| `retries` | no | CLI value or 3 | Max attempts for this service |
+| `retry_delay` | no | CLI value or 2s | Base delay between retries |
+| `retry_backoff` | no | CLI value or exponential | `constant`, `linear`, or `exponential` |
 
 ## State persistence
 
@@ -128,6 +172,8 @@ WantedBy=multi-user.target
 -i, --interval            Seconds between checks (default: 60)
 -t, --timeout             Request timeout in seconds (default: 10)
 -r, --retries             Retries per check before marking down (default: 3)
+--retry-delay             Base delay between retries in seconds (default: 2)
+--retry-backoff           Backoff strategy: constant | linear | exponential (default: exponential)
 --check-once              Single check then exit
 --verbose                 Show OK results in loop mode
 --alert-type              log | email | webhook | both
@@ -147,4 +193,4 @@ WantedBy=multi-user.target
 - Uses stdlib `urllib` – no external HTTP dependencies
 - `requirements.txt` is empty but kept for convention and future deps
 - Graceful shutdown on Ctrl+C, state is saved before exit
-- Retries with 1s delay between attempts before marking a service as down
+- Retries with configurable backoff before marking a service as down
